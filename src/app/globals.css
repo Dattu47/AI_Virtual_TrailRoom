@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  @apply bg-base text-charcoal dark:bg-neutral-950 dark:text-neutral-100;
+}
+
+input,
+select,
+textarea {
+  @apply rounded-lg border border-black/10 bg-white px-3 py-2 outline-none focus:border-accent dark:border-white/10 dark:bg-neutral-900;
+}
+
+button {
+  @apply transition;
+}
