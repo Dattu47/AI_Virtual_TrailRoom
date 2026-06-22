@@ -29,7 +29,8 @@ interface AnalysisResult {
   suitability_summary?: string;
 }
 
-type SelectionMode = "single" | "dual";
+// Three distinct try-on modes
+type SelectionMode = "top" | "bottom" | "dual";
 
 const CATEGORY_TYPES: Record<string, "top" | "bottom" | "full"> = {
   shirt: "top", "t-shirt": "top", kurta: "top", jacket: "top", blazer: "top", sweater: "top",
@@ -41,18 +42,39 @@ function getCategoryType(category: string): "top" | "bottom" | "full" {
   return CATEGORY_TYPES[category.toLowerCase()] || "top";
 }
 
+const MODE_CONFIG = {
+  top: {
+    label: "👕 Top Only",
+    desc: "Try on a shirt, kurta, jacket, or any top garment",
+    color: "blue",
+    ringClass: "ring-blue-400 border-blue-400 bg-blue-500 text-white",
+    inactiveClass: "border-black/10 bg-white/40 dark:border-white/10 dark:bg-neutral-900/40 hover:border-blue-300",
+  },
+  bottom: {
+    label: "👖 Bottom Only",
+    desc: "Try on pants, jeans, shorts, skirts or leggings",
+    color: "purple",
+    ringClass: "ring-purple-400 border-purple-400 bg-purple-500 text-white",
+    inactiveClass: "border-black/10 bg-white/40 dark:border-white/10 dark:bg-neutral-900/40 hover:border-purple-300",
+  },
+  dual: {
+    label: "🧍 Top + Bottom",
+    desc: "Try a complete outfit — top and bottom together",
+    color: "accent",
+    ringClass: "ring-accent border-accent bg-accent text-white",
+    inactiveClass: "border-black/10 bg-white/40 dark:border-white/10 dark:bg-neutral-900/40 hover:border-accent/50",
+  },
+};
+
 export default function ComparePage() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [wardrobe, setWardrobe] = useState<WardrobeItem[]>([]);
 
-  // Selection mode: single garment or dual (top + bottom)
-  const [mode, setMode] = useState<SelectionMode>("single");
+  const [mode, setMode] = useState<SelectionMode>("top");
 
-  // Single mode
-  const [selectedItem, setSelectedItem] = useState<WardrobeItem | null>(null);
-
-  // Dual mode
+  // Top-only / dual top selection
   const [selectedTop, setSelectedTop] = useState<WardrobeItem | null>(null);
+  // Bottom-only / dual bottom selection
   const [selectedBottom, setSelectedBottom] = useState<WardrobeItem | null>(null);
 
   const [resultImage, setResultImage] = useState("");
@@ -76,16 +98,36 @@ export default function ComparePage() {
     return t === "top" || t === "full";
   });
   const bottoms = wardrobe.filter((i) => getCategoryType(i.category) === "bottom");
-  const allItems = wardrobe;
 
   function resetResults() {
     setResultImage("");
     setAnalysis(null);
   }
 
+  function switchMode(newMode: SelectionMode) {
+    setMode(newMode);
+    resetResults();
+    // Don't reset selections — user may want to keep their picks when switching modes
+  }
+
+  // Derive the active garment item for single-garment display
+  const activeItem = mode === "top" ? selectedTop : mode === "bottom" ? selectedBottom : null;
+
+  // Is the user ready to run try-on?
+  const isReadyToTryOn =
+    profile?.body_photo_url &&
+    (mode === "top"
+      ? !!selectedTop
+      : mode === "bottom"
+      ? !!selectedBottom
+      : !!(selectedTop || selectedBottom));
+
   async function runTryOn() {
-    if (mode === "single" && !selectedItem) {
-      return toast.error("Please select a garment from your wardrobe");
+    if (mode === "top" && !selectedTop) {
+      return toast.error("Please select a top garment from your wardrobe");
+    }
+    if (mode === "bottom" && !selectedBottom) {
+      return toast.error("Please select a bottom garment from your wardrobe");
     }
     if (mode === "dual" && !selectedTop && !selectedBottom) {
       return toast.error("Please select at least one garment (top or bottom)");
@@ -99,28 +141,43 @@ export default function ComparePage() {
     setResultImage("");
 
     try {
-      const primaryItem = mode === "single" ? selectedItem : (selectedTop || selectedBottom);
-      const secondaryItem = mode === "dual" ? (selectedTop ? selectedBottom : null) : null;
+      // Build the payload with explicit garmentType so the API can route correctly
+      let garmentType: "upper" | "lower" | "dual";
+      if (mode === "top") garmentType = "upper";
+      else if (mode === "bottom") garmentType = "lower";
+      else garmentType = "dual";
 
       setLoadingStep("Analyzing your body and outfit...");
+
       const payload = {
         userImageUrl: profile.body_photo_url,
-        productImageUrl: primaryItem?.image_url,
-        secondaryImageUrl: secondaryItem?.image_url || null,
-        category: primaryItem?.category || "",
-        secondaryCategory: secondaryItem?.category || "",
-        color: primaryItem?.color || "",
-        secondaryColor: secondaryItem?.color || "",
+        garmentType,
+        // Primary garment (top-only or whichever is selected in dual)
+        topItem: selectedTop
+          ? { image_url: selectedTop.image_url, category: selectedTop.category, color: selectedTop.color }
+          : null,
+        bottomItem: selectedBottom
+          ? { image_url: selectedBottom.image_url, category: selectedBottom.category, color: selectedBottom.color }
+          : null,
+        // Legacy fields for backwards-compat with Agent prompts
+        productImageUrl: selectedTop?.image_url || selectedBottom?.image_url || "",
+        category: selectedTop?.category || selectedBottom?.category || "",
+        color: selectedTop?.color || selectedBottom?.color || "",
         profile,
         wardrobeItems: wardrobe,
         email: profile.email,
         productLink: "",
         selectionMode: mode,
-        topItem: selectedTop ? { image_url: selectedTop.image_url, category: selectedTop.category, color: selectedTop.color } : null,
-        bottomItem: selectedBottom ? { image_url: selectedBottom.image_url, category: selectedBottom.category, color: selectedBottom.color } : null,
       };
 
-      setLoadingStep("Generating virtual try-on image...");
+      setLoadingStep(
+        mode === "dual"
+          ? "Generating try-on image (top first, then bottom)..."
+          : mode === "bottom"
+          ? "Generating try-on image for bottom garment..."
+          : "Generating try-on image..."
+      );
+
       const tryRes = await fetch("/api/tryon", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -129,10 +186,12 @@ export default function ComparePage() {
       const tryJson = await tryRes.json();
 
       if (tryJson.fallback && tryJson.message) {
-        toast.info(tryJson.message, { duration: 4000 });
+        toast.info(tryJson.message, { duration: 5000 });
       }
 
-      const finalTryOn = tryJson.imageUrl || primaryItem?.image_url || "";
+      const primaryUrl =
+        selectedTop?.image_url || selectedBottom?.image_url || "";
+      const finalTryOn = tryJson.imageUrl || primaryUrl;
       setResultImage(finalTryOn);
       setLoadingStep("Running AI styling analysis...");
 
@@ -153,7 +212,9 @@ export default function ComparePage() {
 
   const getMatchingWardrobeItems = (suggestions: string[]) => {
     if (!suggestions?.length) return [];
-    const currentIds = new Set([selectedItem?.id, selectedTop?.id, selectedBottom?.id].filter(Boolean));
+    const currentIds = new Set(
+      [selectedTop?.id, selectedBottom?.id].filter(Boolean)
+    );
     return wardrobe.filter((item) => {
       if (currentIds.has(item.id)) return false;
       const cat = item.category.toLowerCase();
@@ -166,10 +227,6 @@ export default function ComparePage() {
   };
 
   const matchingItems = analysis ? getMatchingWardrobeItems(analysis.pair_with) : [];
-
-  const isReadyToTryOn =
-    profile?.body_photo_url &&
-    (mode === "single" ? !!selectedItem : !!(selectedTop || selectedBottom));
 
   const verdictConfig = {
     great_match: { label: "🌟 Great Match!", cls: "bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-400" },
@@ -185,7 +242,7 @@ export default function ComparePage() {
           <div>
             <h1 className="text-3xl font-extrabold tracking-tight">Try-On Studio</h1>
             <p className="text-sm text-neutral-600 dark:text-neutral-400 mt-1">
-              Select 1 or 2 items from your wardrobe and get an AI-powered virtual try-on with detailed styling advice.
+              Choose a mode, pick garments from your wardrobe, and get a photorealistic AI try-on with styling advice.
             </p>
           </div>
           <Link
@@ -201,153 +258,150 @@ export default function ComparePage() {
         {/* ─── Left Panel: Selection ─── */}
         <div className="space-y-4 lg:col-span-1">
           <div className="rounded-3xl border border-black/5 bg-white/70 p-5 shadow-lg backdrop-blur-md dark:border-white/10 dark:bg-neutral-900/60 space-y-5">
-            <h2 className="text-lg font-bold">1. Select Outfit</h2>
+            <h2 className="text-lg font-bold">1. Choose Mode</h2>
 
-            {/* Mode Switch */}
-            <div className="flex rounded-xl overflow-hidden border border-black/10 dark:border-white/10">
-              <button
-                onClick={() => { setMode("single"); resetResults(); setSelectedTop(null); setSelectedBottom(null); }}
-                className={`flex-1 py-2 text-xs font-semibold transition ${
-                  mode === "single"
-                    ? "bg-accent text-white"
-                    : "bg-white/40 hover:bg-black/5 dark:bg-neutral-900/40 dark:hover:bg-white/5"
-                }`}
-              >
-                Single Item
-              </button>
-              <button
-                onClick={() => { setMode("dual"); resetResults(); setSelectedItem(null); }}
-                className={`flex-1 py-2 text-xs font-semibold transition ${
-                  mode === "dual"
-                    ? "bg-accent text-white"
-                    : "bg-white/40 hover:bg-black/5 dark:bg-neutral-900/40 dark:hover:bg-white/5"
-                }`}
-              >
-                Top + Bottom
-              </button>
+            {/* 3-Mode Selector */}
+            <div className="grid grid-cols-1 gap-2">
+              {(["top", "bottom", "dual"] as SelectionMode[]).map((m) => {
+                const cfg = MODE_CONFIG[m];
+                const isActive = mode === m;
+                return (
+                  <button
+                    key={m}
+                    onClick={() => switchMode(m)}
+                    className={`flex items-center gap-3 rounded-2xl border px-4 py-3 text-left text-sm font-semibold transition-all ${
+                      isActive
+                        ? cfg.ringClass + " ring-2 shadow-md"
+                        : cfg.inactiveClass
+                    }`}
+                  >
+                    <span className="text-xl">{cfg.label.split(" ")[0]}</span>
+                    <div>
+                      <p className={`text-sm font-bold ${isActive ? "text-white" : ""}`}>
+                        {cfg.label.split(" ").slice(1).join(" ")}
+                      </p>
+                      <p className={`text-[10px] leading-tight mt-0.5 ${isActive ? "text-white/80" : "text-neutral-400"}`}>
+                        {cfg.desc}
+                      </p>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
 
-            {wardrobe.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-black/10 dark:border-white/10 p-6 text-center space-y-3">
-                <p className="text-sm text-neutral-500">Your wardrobe is empty.</p>
-                <Link
-                  href="/wardrobe"
-                  className="inline-block rounded-xl bg-accent px-4 py-2 text-xs font-semibold text-white hover:bg-accent/90"
-                >
-                  Add Costumes First
-                </Link>
-              </div>
-            ) : mode === "single" ? (
-              /* Single Mode: show all items */
-              <div className="space-y-2">
-                <p className="text-xs text-neutral-500 font-medium">Select any garment to try on:</p>
-                <div className="grid grid-cols-2 gap-2 max-h-80 overflow-y-auto pr-1">
-                  {allItems.map((item) => {
-                    const isSelected = selectedItem?.id === item.id;
-                    const catType = getCategoryType(item.category);
-                    return (
-                      <button
-                        key={item.id}
-                        onClick={() => { setSelectedItem(item); resetResults(); }}
-                        className={`relative flex flex-col rounded-2xl border p-2 text-left transition ${
-                          isSelected
-                            ? "border-accent bg-accent/5 ring-2 ring-accent"
-                            : "border-black/5 bg-white/40 dark:border-white/10 dark:bg-neutral-900/40 hover:border-accent/30"
-                        }`}
-                      >
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img src={item.image_url} alt={item.category} className="h-24 w-full rounded-xl object-contain bg-neutral-50 dark:bg-neutral-800" />
-                        <div className="mt-1.5">
-                          <p className="text-[11px] font-bold capitalize truncate">{item.color} {item.category}</p>
-                          <span className={`text-[9px] font-semibold uppercase ${catType === "top" ? "text-blue-500" : catType === "bottom" ? "text-purple-500" : "text-pink-500"}`}>
-                            {catType}
-                          </span>
+            {/* ── Garment Picker ── */}
+            <div className="border-t border-black/5 dark:border-white/5 pt-4">
+              <h2 className="text-base font-bold mb-3">2. Select Garment{mode === "dual" ? "s" : ""}</h2>
+
+              {wardrobe.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-black/10 dark:border-white/10 p-6 text-center space-y-3">
+                  <p className="text-sm text-neutral-500">Your wardrobe is empty.</p>
+                  <Link
+                    href="/wardrobe"
+                    className="inline-block rounded-xl bg-accent px-4 py-2 text-xs font-semibold text-white hover:bg-accent/90"
+                  >
+                    Add Costumes First
+                  </Link>
+                </div>
+              ) : (
+                <div className="space-y-4">
+
+                  {/* TOP picker — show in "top" mode and "dual" mode */}
+                  {(mode === "top" || mode === "dual") && (
+                    <div>
+                      <p className="text-xs font-bold text-blue-600 dark:text-blue-400 uppercase tracking-wider mb-2">
+                        👕 {mode === "dual" ? "Top (optional)" : "Select Top"}
+                      </p>
+                      {tops.length === 0 ? (
+                        <p className="text-xs text-neutral-400 italic">No tops in wardrobe yet.</p>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                          {tops.map((item) => {
+                            const isSelected = selectedTop?.id === item.id;
+                            return (
+                              <button
+                                key={item.id}
+                                onClick={() => { setSelectedTop(isSelected ? null : item); resetResults(); }}
+                                className={`relative flex flex-col rounded-xl border p-1.5 text-left transition ${
+                                  isSelected
+                                    ? "border-blue-400 bg-blue-50 dark:bg-blue-950/30 ring-2 ring-blue-400"
+                                    : "border-black/5 bg-white/40 dark:border-white/10 dark:bg-neutral-900/40 hover:border-blue-300"
+                                }`}
+                              >
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img src={item.image_url} alt={item.category} className="h-20 w-full rounded-lg object-contain bg-neutral-50 dark:bg-neutral-800" />
+                                <p className="mt-1 text-[10px] font-semibold capitalize truncate">{item.color} {item.category}</p>
+                                {isSelected && (
+                                  <span className="absolute top-1.5 right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-blue-500 text-[9px] text-white font-bold">✓</span>
+                                )}
+                              </button>
+                            );
+                          })}
                         </div>
-                        {isSelected && (
-                          <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-[10px] font-bold text-white shadow">✓</span>
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : (
-              /* Dual Mode: separate top and bottom pickers */
-              <div className="space-y-4">
-                {/* Top selector */}
-                <div>
-                  <p className="text-xs font-bold text-blue-600 dark:text-blue-400 uppercase tracking-wider mb-2">
-                    👕 Select Top (optional)
-                  </p>
-                  {tops.length === 0 ? (
-                    <p className="text-xs text-neutral-400 italic">No tops in wardrobe yet.</p>
-                  ) : (
-                    <div className="grid grid-cols-2 gap-2 max-h-36 overflow-y-auto pr-1">
-                      {tops.map((item) => {
-                        const isSelected = selectedTop?.id === item.id;
-                        return (
-                          <button
-                            key={item.id}
-                            onClick={() => { setSelectedTop(isSelected ? null : item); resetResults(); }}
-                            className={`relative flex flex-col rounded-xl border p-1.5 transition ${
-                              isSelected
-                                ? "border-blue-400 bg-blue-50 dark:bg-blue-950/30 ring-2 ring-blue-400"
-                                : "border-black/5 bg-white/40 dark:border-white/10 dark:bg-neutral-900/40 hover:border-blue-300"
-                            }`}
+                      )}
+                    </div>
+                  )}
+
+                  {/* BOTTOM picker — show in "bottom" mode and "dual" mode */}
+                  {(mode === "bottom" || mode === "dual") && (
+                    <div>
+                      <p className="text-xs font-bold text-purple-600 dark:text-purple-400 uppercase tracking-wider mb-2">
+                        👖 {mode === "dual" ? "Bottom (optional)" : "Select Bottom"}
+                      </p>
+                      {bottoms.length === 0 ? (
+                        <div className="space-y-2">
+                          <p className="text-xs text-neutral-400 italic">No bottoms in wardrobe yet.</p>
+                          <Link
+                            href="/wardrobe"
+                            className="inline-block text-xs font-semibold text-purple-500 underline"
                           >
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img src={item.image_url} alt={item.category} className="h-20 w-full rounded-lg object-contain bg-neutral-50 dark:bg-neutral-800" />
-                            <p className="mt-1 text-[10px] font-semibold capitalize truncate">{item.color} {item.category}</p>
-                            {isSelected && <span className="absolute top-1.5 right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-blue-500 text-[9px] text-white font-bold">✓</span>}
-                          </button>
-                        );
-                      })}
+                            Add pants/jeans to wardrobe →
+                          </Link>
+                        </div>
+                      ) : (
+                        <div className="grid grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                          {bottoms.map((item) => {
+                            const isSelected = selectedBottom?.id === item.id;
+                            return (
+                              <button
+                                key={item.id}
+                                onClick={() => { setSelectedBottom(isSelected ? null : item); resetResults(); }}
+                                className={`relative flex flex-col rounded-xl border p-1.5 text-left transition ${
+                                  isSelected
+                                    ? "border-purple-400 bg-purple-50 dark:bg-purple-950/30 ring-2 ring-purple-400"
+                                    : "border-black/5 bg-white/40 dark:border-white/10 dark:bg-neutral-900/40 hover:border-purple-300"
+                                }`}
+                              >
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img src={item.image_url} alt={item.category} className="h-20 w-full rounded-lg object-contain bg-neutral-50 dark:bg-neutral-800" />
+                                <p className="mt-1 text-[10px] font-semibold capitalize truncate">{item.color} {item.category}</p>
+                                {isSelected && (
+                                  <span className="absolute top-1.5 right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-purple-500 text-[9px] text-white font-bold">✓</span>
+                                )}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Dual mode selection summary */}
+                  {mode === "dual" && (selectedTop || selectedBottom) && (
+                    <div className="rounded-xl bg-accent/5 border border-accent/15 p-3 space-y-1">
+                      <p className="text-[11px] font-bold text-accent uppercase tracking-wider">Selected outfit:</p>
+                      {selectedTop && <p className="text-xs">👕 {selectedTop.color} {selectedTop.category}</p>}
+                      {selectedBottom && <p className="text-xs">👖 {selectedBottom.color} {selectedBottom.category}</p>}
+                      {selectedTop && selectedBottom && (
+                        <p className="text-[10px] text-neutral-400 mt-1">
+                          ✓ Two-pass try-on: top applied first, then bottom layered on result
+                        </p>
+                      )}
                     </div>
                   )}
                 </div>
-
-                {/* Bottom selector */}
-                <div>
-                  <p className="text-xs font-bold text-purple-600 dark:text-purple-400 uppercase tracking-wider mb-2">
-                    👖 Select Bottom (optional)
-                  </p>
-                  {bottoms.length === 0 ? (
-                    <p className="text-xs text-neutral-400 italic">No bottoms in wardrobe yet.</p>
-                  ) : (
-                    <div className="grid grid-cols-2 gap-2 max-h-36 overflow-y-auto pr-1">
-                      {bottoms.map((item) => {
-                        const isSelected = selectedBottom?.id === item.id;
-                        return (
-                          <button
-                            key={item.id}
-                            onClick={() => { setSelectedBottom(isSelected ? null : item); resetResults(); }}
-                            className={`relative flex flex-col rounded-xl border p-1.5 transition ${
-                              isSelected
-                                ? "border-purple-400 bg-purple-50 dark:bg-purple-950/30 ring-2 ring-purple-400"
-                                : "border-black/5 bg-white/40 dark:border-white/10 dark:bg-neutral-900/40 hover:border-purple-300"
-                            }`}
-                          >
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img src={item.image_url} alt={item.category} className="h-20 w-full rounded-lg object-contain bg-neutral-50 dark:bg-neutral-800" />
-                            <p className="mt-1 text-[10px] font-semibold capitalize truncate">{item.color} {item.category}</p>
-                            {isSelected && <span className="absolute top-1.5 right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-purple-500 text-[9px] text-white font-bold">✓</span>}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-
-                {/* Dual mode summary */}
-                {(selectedTop || selectedBottom) && (
-                  <div className="rounded-xl bg-black/5 dark:bg-white/5 p-3 space-y-1">
-                    <p className="text-[11px] font-bold text-neutral-500 uppercase tracking-wider">Selected outfit:</p>
-                    {selectedTop && <p className="text-xs">👕 {selectedTop.color} {selectedTop.category}</p>}
-                    {selectedBottom && <p className="text-xs">👖 {selectedBottom.color} {selectedBottom.category}</p>}
-                  </div>
-                )}
-              </div>
-            )}
+              )}
+            </div>
 
             {/* Body photo warning / Run button */}
             <div className="border-t border-black/5 pt-4 dark:border-white/5">
@@ -370,11 +424,23 @@ export default function ComparePage() {
                       {loadingStep || "Processing..."}
                     </span>
                   ) : (
-                    "🪞 Run Virtual Try-On"
+                    `🪞 Run Virtual Try-On${mode === "dual" ? " (Top + Bottom)" : ""}`
                   )}
                 </button>
               )}
             </div>
+
+            {/* Mode hint card */}
+            {mode === "bottom" && (
+              <div className="rounded-xl bg-purple-50 dark:bg-purple-950/20 border border-purple-100 dark:border-purple-900/30 p-3 text-xs text-purple-700 dark:text-purple-300">
+                <strong>💡 Bottom mode:</strong> Uses CatVTON model which specialises in lower-body garments. Works best with clear, front-facing garment photos on a light background.
+              </div>
+            )}
+            {mode === "dual" && (
+              <div className="rounded-xl bg-accent/5 border border-accent/15 p-3 text-xs text-neutral-600 dark:text-neutral-300">
+                <strong>💡 Dual mode:</strong> Applies top first, then layers the bottom onto that result — two AI passes for a complete outfit try-on.
+              </div>
+            )}
           </div>
         </div>
 
@@ -412,12 +478,20 @@ export default function ComparePage() {
           {/* Selected items preview (before running) */}
           {!resultImage && !loading && (
             <div className="rounded-3xl border border-dashed border-black/10 dark:border-white/10 p-8 text-center space-y-4">
-              {mode === "single" && selectedItem ? (
+              {mode === "top" && selectedTop ? (
                 <div className="flex flex-col items-center gap-3">
-                  <p className="text-sm font-medium text-neutral-500">Selected garment:</p>
+                  <p className="text-sm font-medium text-neutral-500">Selected top garment:</p>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={selectedItem.image_url} alt={selectedItem.category} className="h-36 rounded-xl object-contain shadow" />
-                  <p className="font-semibold capitalize">{selectedItem.color} {selectedItem.category}</p>
+                  <img src={selectedTop.image_url} alt={selectedTop.category} className="h-36 rounded-xl object-contain shadow" />
+                  <p className="font-semibold capitalize">{selectedTop.color} {selectedTop.category}</p>
+                  <p className="text-xs text-neutral-400">Click &quot;Run Virtual Try-On&quot; to see how it looks on you</p>
+                </div>
+              ) : mode === "bottom" && selectedBottom ? (
+                <div className="flex flex-col items-center gap-3">
+                  <p className="text-sm font-medium text-purple-500">Selected bottom garment:</p>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={selectedBottom.image_url} alt={selectedBottom.category} className="h-36 rounded-xl object-contain shadow" />
+                  <p className="font-semibold capitalize">{selectedBottom.color} {selectedBottom.category}</p>
                   <p className="text-xs text-neutral-400">Click &quot;Run Virtual Try-On&quot; to see how it looks on you</p>
                 </div>
               ) : mode === "dual" && (selectedTop || selectedBottom) ? (
@@ -442,7 +516,11 @@ export default function ComparePage() {
                 <div className="space-y-2">
                   <span className="text-5xl">🪞</span>
                   <p className="text-sm text-neutral-500">
-                    Select outfit items on the left, then run the virtual try-on.
+                    {mode === "top"
+                      ? "Select a top garment on the left, then run the virtual try-on."
+                      : mode === "bottom"
+                      ? "Select a bottom garment (pants/jeans/shorts) on the left, then run the virtual try-on."
+                      : "Select top and/or bottom garments on the left, then run the virtual try-on."}
                   </p>
                 </div>
               )}
@@ -548,7 +626,7 @@ export default function ComparePage() {
               {analysis.recommended_colors?.length > 0 && (
                 <div className="rounded-2xl border border-black/5 bg-white/40 p-4 dark:border-white/5 dark:bg-neutral-800/40">
                   <h4 className="text-xs font-bold text-neutral-500 uppercase tracking-wider mb-3">
-                    🎨 Color Compatibility & Suggestions
+                    🎨 Color Compatibility &amp; Suggestions
                   </h4>
                   <div className="grid gap-4 sm:grid-cols-3">
                     <div>

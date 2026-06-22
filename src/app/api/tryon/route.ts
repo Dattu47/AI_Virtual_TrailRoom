@@ -12,6 +12,7 @@ const gemini = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
   : null;
 
+// ── Types ──────────────────────────────────────────────────────────────────
 interface Agent1Output {
   skinTone: string;
   bodyType: string;
@@ -44,7 +45,16 @@ interface Agent3Output {
   suitability_summary: string;
 }
 
+// ── Image Utilities ────────────────────────────────────────────────────────
+
+// Cache fetched images in memory for the duration of a single request
+const imageCache = new Map<string, { buffer: Buffer; mimeType: string }>();
+
 async function urlToBuffer(urlOrPath: string): Promise<{ buffer: Buffer; mimeType: string }> {
+  if (imageCache.has(urlOrPath)) {
+    return imageCache.get(urlOrPath)!;
+  }
+
   let buffer: Buffer;
   let mimeType = "image/jpeg";
 
@@ -53,17 +63,25 @@ async function urlToBuffer(urlOrPath: string): Promise<{ buffer: Buffer; mimeTyp
   else if (ext === "webp") mimeType = "image/webp";
 
   if (urlOrPath.startsWith("http://") || urlOrPath.startsWith("https://")) {
-    const res = await fetch(urlOrPath);
-    if (!res.ok) throw new Error(`Failed to fetch remote image: ${res.statusText}`);
-    const arrayBuffer = await res.arrayBuffer();
-    buffer = Buffer.from(arrayBuffer);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const res = await fetch(urlOrPath, { signal: controller.signal });
+      if (!res.ok) throw new Error(`Failed to fetch remote image: ${res.statusText}`);
+      const arrayBuffer = await res.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+    } finally {
+      clearTimeout(timeout);
+    }
   } else {
     const cleanPath = urlOrPath.startsWith("/") ? urlOrPath.slice(1) : urlOrPath;
     const localPath = path.join(process.cwd(), "public", cleanPath);
     buffer = await fs.readFile(localPath);
   }
 
-  return { buffer, mimeType };
+  const result = { buffer, mimeType };
+  imageCache.set(urlOrPath, result);
+  return result;
 }
 
 async function urlToGenerativePart(
@@ -99,15 +117,122 @@ function localFallbackAnalysis(): Agent3Output {
   };
 }
 
+// ── CatVTON helper ────────────────────────────────────────────────────────
+/**
+ * Run a single CatVTON pass.
+ * @param personUrl   URL or local path for the person/base image
+ * @param garmentUrl  URL or local path for the garment image
+ * @param clothType   "upper" | "lower" | "overall"
+ * @param hfToken     Optional HuggingFace token
+ * @returns           Result image as Buffer
+ */
+async function runCatVTON(
+  personUrl: string,
+  garmentUrl: string,
+  clothType: "upper" | "lower" | "overall",
+  hfToken: `hf_${string}` | undefined
+): Promise<Buffer> {
+  const { Client: GradioClient, handle_file } = await import("@gradio/client");
+
+  // CatVTON accepts a person image and a garment image, and returns a try-on result
+  const catApp = await GradioClient.connect(
+    "zhengchong/CatVTON",
+    hfToken ? { token: hfToken } : undefined
+  );
+
+  // Step 1: prepare person image
+  const prepResult = await catApp.predict("/person_example_fn", {
+    image_path: handle_file(personUrl),
+  });
+  const personImageObj = (prepResult.data as Array<unknown>)?.[0];
+  if (!personImageObj) throw new Error("CatVTON: failed to prepare person image");
+
+  // Step 2: run try-on
+  const catResult = await catApp.predict("/submit_function", {
+    person_image: personImageObj,
+    cloth_image: handle_file(garmentUrl),
+    cloth_type: clothType,
+    num_inference_steps: 50,       // Higher steps → better quality
+    guidance_scale: 2.5,
+    seed: Math.floor(Math.random() * 100000),
+    show_type: "result only",
+  });
+
+  const generatedImageUrl = (catResult.data as Array<{ url?: string }>)?.[0]?.url;
+  if (!generatedImageUrl) throw new Error("CatVTON: no image URL in response");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const imageFetchRes = await fetch(generatedImageUrl, { signal: controller.signal });
+    if (!imageFetchRes.ok) throw new Error("CatVTON: failed to fetch result image");
+    const arrayBuffer = await imageFetchRes.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ── IDM-VTON helper (upper-body only) ────────────────────────────────────
+async function runIDMVTON(
+  userImageUrl: string,
+  garmentUrl: string,
+  garmentDescription: string,
+  hfToken: `hf_${string}` | undefined
+): Promise<Buffer> {
+  const { Client: GradioClient, handle_file } = await import("@gradio/client");
+
+  const idmApp = await GradioClient.connect(
+    "yisol/IDM-VTON",
+    hfToken ? { token: hfToken } : undefined
+  );
+
+  const idmResult = await idmApp.predict("/tryon", {
+    dict: {
+      background: handle_file(userImageUrl),
+      layers: [],
+      composite: null,
+    },
+    garm_img: handle_file(garmentUrl),
+    garment_des: garmentDescription || "clothing item",
+    is_checked: true,
+    is_checked_crop: false,
+    denoise_steps: 40,            // Increased from 30 for better quality
+    seed: Math.floor(Math.random() * 100000),
+  });
+
+  const generatedImageUrl = (idmResult.data as Array<{ url?: string }>)?.[0]?.url;
+  if (!generatedImageUrl) throw new Error("IDM-VTON: no image URL in response");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const imageFetchRes = await fetch(generatedImageUrl, { signal: controller.signal });
+    if (!imageFetchRes.ok) throw new Error("IDM-VTON: failed to fetch result image");
+    const arrayBuffer = await imageFetchRes.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ── Main API Handler ───────────────────────────────────────────────────────
 export async function POST(req: Request) {
+  // Clear per-request image cache
+  imageCache.clear();
+
   try {
     const body = await req.json();
     const session = await requireSession();
 
-    // ── FREE MODE ──────────────────────────────────────────
+    // ── FREE MODE ──────────────────────────────────────────────────────────
     if (isFreeMode || !gemini) {
       const mockResult = localFallbackAnalysis();
-      const fallbackUrl = body.topItem?.image_url || body.productImageUrl || null;
+      const fallbackUrl =
+        body.topItem?.image_url ||
+        body.bottomItem?.image_url ||
+        body.productImageUrl ||
+        null;
 
       if (body.email) {
         const profile = await getProfileByEmail(body.email);
@@ -144,25 +269,52 @@ export async function POST(req: Request) {
       });
     }
 
-    // ── PRODUCTION MODE ────────────────────────────────────
+    // ── PRODUCTION MODE ────────────────────────────────────────────────────
     const flashModel = gemini.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-    // Determine primary & secondary garment
-    const primaryImageUrl: string =
-      body.topItem?.image_url || body.productImageUrl;
-    const secondaryImageUrl: string | null =
-      body.bottomItem?.image_url || body.secondaryImageUrl || null;
+    // garmentType comes explicitly from the new frontend:
+    //   "upper"  → Top-only (use IDM-VTON, fall back to CatVTON upper)
+    //   "lower"  → Bottom-only (skip IDM-VTON, go direct to CatVTON lower)
+    //   "dual"   → Top + Bottom (two-pass CatVTON)
+    const garmentType: "upper" | "lower" | "dual" =
+      body.garmentType ||
+      (body.topItem && body.bottomItem
+        ? "dual"
+        : body.bottomItem
+        ? "lower"
+        : "upper");
 
-    const primaryCategory: string =
-      body.topItem?.category || body.category || "shirt";
-    const secondaryCategory: string | null =
-      body.bottomItem?.category || body.secondaryCategory || null;
+    const topItem = body.topItem as { image_url: string; category: string; color: string } | null;
+    const bottomItem = body.bottomItem as { image_url: string; category: string; color: string } | null;
+
+    // Determine primary garment for analysis context
+    const primaryItem = garmentType === "lower" ? bottomItem : topItem;
+    const primaryImageUrl: string = primaryItem?.image_url || body.productImageUrl || "";
+    const primaryCategory: string = primaryItem?.category || body.category || "shirt";
 
     if (!primaryImageUrl) {
       return NextResponse.json({ error: "No garment image provided" }, { status: 400 });
     }
 
-    // ── Agent 1: Fashion Understanding ─────────────────────
+    const outfitDesc =
+      garmentType === "dual" && topItem && bottomItem
+        ? `a ${topItem.color} ${topItem.category} (top) paired with a ${bottomItem.color} ${bottomItem.category} (bottom)`
+        : garmentType === "lower"
+        ? `${bottomItem?.color || ""} ${primaryCategory} (bottom garment)`
+        : `${topItem?.color || ""} ${primaryCategory}`;
+
+    // ── Pre-fetch images in parallel ─────────────────────────────────────
+    console.log("Pre-fetching images in parallel...");
+    const imageFetchPromises: Promise<void>[] = [
+      urlToBuffer(body.userImageUrl).then(() => {}),
+      urlToBuffer(primaryImageUrl).then(() => {}),
+    ];
+    if (garmentType === "dual" && bottomItem?.image_url) {
+      imageFetchPromises.push(urlToBuffer(bottomItem.image_url).then(() => {}));
+    }
+    await Promise.allSettled(imageFetchPromises);
+
+    // ── Agent 1: Fashion Understanding ───────────────────────────────────
     console.log("Agent 1: Fashion Understanding...");
     const humanPart = await urlToGenerativePart(body.userImageUrl);
     const garmentPart = await urlToGenerativePart(primaryImageUrl);
@@ -173,18 +325,14 @@ export async function POST(req: Request) {
     ];
 
     let secondaryGarmentPart: { inlineData: { data: string; mimeType: string } } | null = null;
-    if (secondaryImageUrl) {
-      secondaryGarmentPart = await urlToGenerativePart(secondaryImageUrl);
+    if (garmentType === "dual" && bottomItem?.image_url) {
+      secondaryGarmentPart = await urlToGenerativePart(bottomItem.image_url);
       parts.push(secondaryGarmentPart);
     }
 
-    const outfitDesc = secondaryImageUrl
-      ? `a ${body.topItem?.color || ""} ${primaryCategory} (top) paired with a ${body.bottomItem?.color || ""} ${secondaryCategory} (bottom)`
-      : `a ${body.color || ""} ${primaryCategory}`;
-
     const agent1Prompt = `You are a Fashion Understanding AI agent. Analyze the uploaded images:
 1. Person's full-body photo (standing image).
-2. Garment photo: ${outfitDesc}${secondaryImageUrl ? "\n3. Second garment (bottom)." : ""}
+2. Garment photo: ${outfitDesc}${garmentType === "dual" ? "\n3. Second garment (bottom)." : ""}
 
 Tasks:
 - Detect skin tone: very fair / fair / wheatish / dusky / dark
@@ -215,14 +363,14 @@ Return ONLY valid JSON:
         skinTone: "wheatish",
         bodyType: "regular",
         shirtStyle: "casual",
-        color: body.color || "blue",
+        color: primaryItem?.color || "blue",
         fitSuggestion: "regular fit",
         matchScore: 75,
         outfitDescription: outfitDesc,
       };
     }
 
-    // ── Agent 2: Garment Description ─────────────────────
+    // ── Agent 2: Garment Description ─────────────────────────────────────
     console.log("Agent 2: Generating garment description...");
     const agent2Prompt = `Based on this fashion analysis data: ${JSON.stringify(agent1Data)}
 Write a 2-3 sentence highly detailed description of the complete outfit to guide image generation.
@@ -232,117 +380,121 @@ Return ONLY the description text.`;
     const agent2Result = await flashModel.generateContent(agent2Prompt);
     const garmentDescription = agent2Result.response.text().trim();
 
-    // ── VTON / Image Generation ────────────────────────────
-    console.log("Starting VTON Image Generation...");
+    // ── VTON Image Generation ────────────────────────────────────────────
+    console.log(`Starting VTON — garmentType: ${garmentType}`);
     let tryOnImageBuffer: Buffer | null = null;
     let tryOnResultUrl: string | null = null;
 
-    // Try IDM-VTON first (primary garment only for now)
+    const hfToken = process.env.HF_TOKEN as `hf_${string}` | undefined;
+
+    // Global timeout for the entire VTON section (120 seconds)
+    const vtonController = new AbortController();
+    const vtonTimeout = setTimeout(() => vtonController.abort(), 120_000);
+
     try {
-      const { Client: GradioClient, handle_file } = await import("@gradio/client");
-      console.log("Connecting to yisol/IDM-VTON...");
-      const hfToken = process.env.HF_TOKEN as `hf_${string}` | undefined;
-      const idmApp = await GradioClient.connect(
-        "yisol/IDM-VTON",
-        hfToken ? { token: hfToken } : undefined
-      );
-
-      const idmResult = await idmApp.predict("/tryon", {
-        dict: {
-          background: handle_file(body.userImageUrl),
-          layers: [],
-          composite: null,
-        },
-        garm_img: handle_file(primaryImageUrl),
-        garment_des: garmentDescription || "clothing item",
-        is_checked: true,
-        is_checked_crop: false,
-        denoise_steps: 30,
-        seed: Math.floor(Math.random() * 100000),
-      });
-
-      const generatedImageUrl = (idmResult.data as Array<{url?: string}>)?.[0]?.url;
-      if (!generatedImageUrl) throw new Error("No image URL from IDM-VTON");
-
-      const imageFetchRes = await fetch(generatedImageUrl);
-      if (!imageFetchRes.ok) throw new Error(`Failed to fetch IDM-VTON image`);
-      const arrayBuffer = await imageFetchRes.arrayBuffer();
-      tryOnImageBuffer = Buffer.from(arrayBuffer);
-      console.log("IDM-VTON success.");
-    } catch (idmError) {
-      console.warn("IDM-VTON failed, trying CatVTON...", idmError);
-
-      // Try CatVTON fallback
-      try {
-        const { Client: GradioClient, handle_file } = await import("@gradio/client");
-        const hfToken = process.env.HF_TOKEN as `hf_${string}` | undefined;
-        const catApp = await GradioClient.connect(
-          "zhengchong/CatVTON",
-          hfToken ? { token: hfToken } : undefined
+      if (garmentType === "lower") {
+        // ── BOTTOM-ONLY: Go directly to CatVTON with cloth_type "lower" ──
+        // IDM-VTON is an upper-body-only model — skip it entirely for bottoms
+        console.log("Bottom-only mode: using CatVTON with cloth_type=lower");
+        tryOnImageBuffer = await runCatVTON(
+          body.userImageUrl,
+          bottomItem!.image_url,
+          "lower",
+          hfToken
+        );
+        console.log("CatVTON (lower) success.");
+      } else if (garmentType === "dual" && topItem && bottomItem) {
+        // ── DUAL MODE: Two-pass CatVTON ──────────────────────────────────
+        // Pass 1: Apply top garment
+        console.log("Dual mode — Pass 1: applying top with CatVTON (upper)...");
+        const pass1Buffer = await runCatVTON(
+          body.userImageUrl,
+          topItem.image_url,
+          "upper",
+          hfToken
         );
 
-        const prepResult = await catApp.predict("/person_example_fn", {
-          image_path: handle_file(body.userImageUrl),
-        });
-        const personImageObj = (prepResult.data as Array<unknown>)?.[0];
-        if (!personImageObj) throw new Error("Failed to prepare person image for CatVTON");
+        // We need to save the pass-1 result temporarily so CatVTON can use it as the person image.
+        // Upload to Supabase as a temp file, or use a data URI.
+        let pass1Url: string;
+        if (supabaseAdmin) {
+          const tempPath = `${session.user.id || "user"}/tryon/temp-pass1-${Date.now()}.png`;
+          const { error: tempUploadError } = await supabaseAdmin.storage
+            .from(process.env.SUPABASE_STORAGE_BUCKET!)
+            .upload(tempPath, pass1Buffer, { contentType: "image/png", upsert: false });
 
-        const categoryLower = primaryCategory.toLowerCase();
-        let clothType = "upper";
-        if (
-          categoryLower.includes("pant") ||
-          categoryLower.includes("trouser") ||
-          categoryLower.includes("jeans") ||
-          categoryLower.includes("skirt") ||
-          categoryLower.includes("short") ||
-          categoryLower.includes("legging")
-        ) {
-          clothType = "lower";
-        } else if (
-          categoryLower.includes("dress") ||
-          categoryLower.includes("suit") ||
-          categoryLower.includes("overall") ||
-          categoryLower.includes("saree") ||
-          categoryLower.includes("co-ord")
-        ) {
-          clothType = "overall";
+          if (tempUploadError) {
+            throw new Error(`Failed to upload pass-1 temp image: ${tempUploadError.message}`);
+          }
+          const { data: tempData } = supabaseAdmin.storage
+            .from(process.env.SUPABASE_STORAGE_BUCKET!)
+            .getPublicUrl(tempPath);
+          pass1Url = tempData.publicUrl;
+        } else {
+          // Fallback: convert buffer to base64 data URI for local/free mode
+          pass1Url = `data:image/png;base64,${pass1Buffer.toString("base64")}`;
         }
 
-        const catResult = await catApp.predict("/submit_function", {
-          person_image: personImageObj,
-          cloth_image: handle_file(primaryImageUrl),
-          cloth_type: clothType,
-          num_inference_steps: 30,
-          guidance_scale: 2.5,
-          seed: Math.floor(Math.random() * 100000),
-          show_type: "result only",
-        });
+        // Pass 2: Apply bottom garment on the pass-1 result image
+        console.log("Dual mode — Pass 2: applying bottom with CatVTON (lower)...");
+        tryOnImageBuffer = await runCatVTON(
+          pass1Url,
+          bottomItem.image_url,
+          "lower",
+          hfToken
+        );
+        console.log("Dual-pass CatVTON success.");
 
-        const generatedImageUrl = (catResult.data as Array<{url?: string}>)?.[0]?.url;
-        if (!generatedImageUrl) throw new Error("No image URL from CatVTON");
-
-        const imageFetchRes = await fetch(generatedImageUrl);
-        if (!imageFetchRes.ok) throw new Error("Failed to fetch CatVTON image");
-        const arrayBuffer = await imageFetchRes.arrayBuffer();
-        tryOnImageBuffer = Buffer.from(arrayBuffer);
-        console.log("CatVTON success.");
-      } catch (catError) {
-        console.warn("CatVTON also failed. Using Gemini image generation...", catError);
-
-        // ── Gemini Imagen fallback ─────────────────────────
+        // Clean up temp file
+        if (supabaseAdmin && pass1Url.startsWith("http")) {
+          const tempPath = pass1Url.split(`${process.env.SUPABASE_STORAGE_BUCKET}/`)[1];
+          if (tempPath) {
+            supabaseAdmin.storage
+              .from(process.env.SUPABASE_STORAGE_BUCKET!)
+              .remove([tempPath])
+              .catch(() => {}); // Non-blocking cleanup
+          }
+        }
+      } else {
+        // ── TOP-ONLY: Try IDM-VTON first, fall back to CatVTON upper ────
+        console.log("Top-only mode: trying IDM-VTON first...");
         try {
+          tryOnImageBuffer = await runIDMVTON(
+            body.userImageUrl,
+            primaryImageUrl,
+            garmentDescription || "clothing item",
+            hfToken
+          );
+          console.log("IDM-VTON success.");
+        } catch (idmError) {
+          console.warn("IDM-VTON failed, falling back to CatVTON (upper)...", idmError);
+          tryOnImageBuffer = await runCatVTON(
+            body.userImageUrl,
+            primaryImageUrl,
+            "upper",
+            hfToken
+          );
+          console.log("CatVTON (upper) fallback success.");
+        }
+      }
+    } catch (vtonError) {
+      console.warn("All VTON methods failed. Trying Gemini imagen fallback...", vtonError);
+
+      // ── Gemini Imagen last-resort fallback ───────────────────────────
+      try {
+        if (gemini) {
           const imagenModel = gemini.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
 
           const userPart = await urlToGenerativePart(body.userImageUrl);
           const garment1Part = await urlToGenerativePart(primaryImageUrl);
           const extraParts: Array<{ inlineData: { data: string; mimeType: string } }> = [];
-          if (secondaryImageUrl) {
-            extraParts.push(await urlToGenerativePart(secondaryImageUrl));
+          if (garmentType === "dual" && bottomItem?.image_url) {
+            extraParts.push(await urlToGenerativePart(bottomItem.image_url));
           }
 
           const imagenPrompt = `You are a virtual try-on AI system. I will provide:
 1. A reference photo of a person (standing, full-body view)
-2. A garment image (${outfitDesc})${secondaryImageUrl ? "\n3. Another garment (bottom piece)" : ""}
+2. A garment image (${outfitDesc})${garmentType === "dual" ? "\n3. Another garment (bottom piece)" : ""}
 
 Your task: Generate a photorealistic image of the SAME person wearing the selected garment(s).
 
@@ -363,7 +515,6 @@ Generate the try-on image now.`;
             ...extraParts,
           ]);
 
-          // Extract image from response if present
           const response = imagenResult.response;
           const candidates = response.candidates;
           if (candidates?.[0]?.content?.parts) {
@@ -375,19 +526,17 @@ Generate the try-on image now.`;
             }
           }
 
-          if (!tryOnImageBuffer) {
-            throw new Error("Gemini did not return an image");
-          }
+          if (!tryOnImageBuffer) throw new Error("Gemini did not return an image");
           console.log("Gemini imagen fallback success.");
-        } catch (imagenError) {
-          console.warn("Gemini imagen also failed, using original user photo...", imagenError);
-          // Last resort: use user's photo + return clothing image as the "result"
-          // We still provide analysis based on what we know
         }
+      } catch (imagenError) {
+        console.warn("Gemini imagen also failed, using garment image as result...", imagenError);
       }
+    } finally {
+      clearTimeout(vtonTimeout);
     }
 
-    // ── Upload result to Supabase ─────────────────────────
+    // ── Upload final result to Supabase ──────────────────────────────────
     if (tryOnImageBuffer) {
       if (!supabaseAdmin) {
         throw new Error("Supabase is not configured to save try-on results");
@@ -411,11 +560,10 @@ Generate the try-on image now.`;
       }
     }
 
-    // If no try-on image was generated, return the primary garment as a reference
     const finalImageUrl = tryOnResultUrl || primaryImageUrl;
     const isFallback = !tryOnResultUrl;
 
-    // ── Agent 3: Styling Feedback ──────────────────────────
+    // ── Agent 3: Styling Feedback ─────────────────────────────────────────
     console.log("Agent 3: Styling & Suitability Feedback...");
     const tryOnPart = tryOnResultUrl
       ? await urlToGenerativePart(tryOnResultUrl)
@@ -434,9 +582,10 @@ Context:
 - User profile: ${JSON.stringify(body.profile || {})}
 - Fashion analysis: ${JSON.stringify(agent1Data)}
 - Selected outfit: ${outfitDesc}
+- Garment type focus: ${garmentType === "lower" ? "BOTTOM garment (pants/jeans/skirt)" : garmentType === "dual" ? "COMPLETE OUTFIT (top + bottom)" : "TOP garment"}
 - Existing wardrobe: ${wardrobePrompt}
 
-FOCUS: Your goal is to evaluate whether this COSTUME SUITS the user — not just fit, but color compatibility with their skin tone, style coherence, and occasion appropriateness. Give practical, honest, specific suggestions.
+FOCUS: Evaluate whether this COSTUME SUITS the user — not just fit, but color compatibility with their skin tone, style coherence, and occasion appropriateness. Give practical, honest, specific suggestions.
 
 Return ONLY valid JSON with ALL these keys:
 {
@@ -471,7 +620,7 @@ Return ONLY valid JSON with ALL these keys:
       stylistReport = localFallbackAnalysis();
     }
 
-    // ── Save to DB ────────────────────────────────────────
+    // ── Save to DB ────────────────────────────────────────────────────────
     if (supabaseAdmin && body.email) {
       try {
         const { data: profile } = await supabaseAdmin
